@@ -9110,8 +9110,10 @@ static int btrfs_getattr(struct vfsmount *mnt,
 	return 0;
 }
 
-static int btrfs_rename_exchange(struct inode *old_dir, struct dentry *old_dentry,
-			      struct inode *new_dir, struct dentry *new_dentry)
+static int btrfs_rename_exchange(struct inode *old_dir,
+			      struct dentry *old_dentry,
+			      struct inode *new_dir,
+			      struct dentry *new_dentry)
 {
 	struct btrfs_trans_handle *trans;
 	struct btrfs_root *root = BTRFS_I(old_dir)->root;
@@ -9119,6 +9121,7 @@ static int btrfs_rename_exchange(struct inode *old_dir, struct dentry *old_dentr
 	struct inode *new_inode = new_dentry->d_inode;
 	struct inode *old_inode = old_dentry->d_inode;
 	struct timespec ctime = CURRENT_TIME;
+	struct dentry *parent;
 	u64 old_ino = btrfs_ino(old_inode);
 	u64 new_ino = btrfs_ino(new_inode);
 	u64 old_idx = 0;
@@ -9146,9 +9149,9 @@ static int btrfs_rename_exchange(struct inode *old_dir, struct dentry *old_dentr
 	 */
 	trans = btrfs_start_transaction(root, 12);
 	if (IS_ERR(trans)) {
-                ret = PTR_ERR(trans);
-                goto out_notrans;
-        }
+		ret = PTR_ERR(trans);
+		goto out_notrans;
+	}
 
 	/*
 	 * We need to find a free sequence number both in the source and
@@ -9273,12 +9276,12 @@ static int btrfs_rename_exchange(struct inode *old_dir, struct dentry *old_dentr
 		BTRFS_I(new_inode)->dir_index = new_idx;
 
 	if (old_ino != BTRFS_FIRST_FREE_OBJECTID) {
-		struct dentry *parent = new_dentry->d_parent;
+		parent = new_dentry->d_parent;
 		btrfs_log_new_name(trans, old_inode, old_dir, parent);
 		btrfs_end_log_trans(root);
 	}
 	if (new_ino != BTRFS_FIRST_FREE_OBJECTID) {
-		struct dentry *parent = old_dentry->d_parent;
+		parent = old_dentry->d_parent;
 		btrfs_log_new_name(trans, new_inode, new_dir, parent);
 		btrfs_end_log_trans(dest);
 	}
@@ -9295,16 +9298,20 @@ out_notrans:
 }
 
 static int btrfs_rename(struct inode *old_dir, struct dentry *old_dentry,
-			   struct inode *new_dir, struct dentry *new_dentry)
+			   struct inode *new_dir, struct dentry *new_dentry,
+			   unsigned int flags)
 {
 	struct btrfs_trans_handle *trans;
 	struct btrfs_root *root = BTRFS_I(old_dir)->root;
 	struct btrfs_root *dest = BTRFS_I(new_dir)->root;
 	struct inode *new_inode = d_inode(new_dentry);
 	struct inode *old_inode = d_inode(old_dentry);
+	struct inode *whiteout_inode = NULL;
 	struct timespec ctime = CURRENT_TIME;
 	u64 index = 0;
+	u64 whiteout_index;
 	u64 root_objectid;
+	u64 whiteout_objectid;
 	int ret;
 	u64 old_ino = btrfs_ino(old_inode);
 
@@ -9357,15 +9364,15 @@ static int btrfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	 * We want to reserve the absolute worst case amount of items.  So if
 	 * both inodes are subvols and we need to unlink them then that would
 	 * require 4 item modifications, but if they are both normal inodes it
-	 * would require 5 item modifications, so we'll assume their normal
+	 * would require 5 item modifications, so we'll assume they are normal
 	 * inodes.  So 5 * 2 is 10, plus 1 for the new link, so 11 total items
 	 * should cover the worst case number of items we'll modify.
 	 */
 	trans = btrfs_start_transaction(root, 11);
 	if (IS_ERR(trans)) {
-                ret = PTR_ERR(trans);
-                goto out_notrans;
-        }
+		ret = PTR_ERR(trans);
+		goto out_notrans;
+	}
 
 	if (dest != root)
 		btrfs_record_root_in_trans(trans, dest);
@@ -9465,6 +9472,55 @@ static int btrfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 		btrfs_log_new_name(trans, old_inode, old_dir, parent);
 		btrfs_end_log_trans(root);
 	}
+
+	if (flags & RENAME_WHITEOUT) {
+		ret = btrfs_find_free_ino(root, &whiteout_objectid);
+		if (ret) {
+			btrfs_abort_transaction(trans, root, ret);
+			goto out_fail;
+		}
+
+		whiteout_inode = btrfs_new_inode(trans, root, old_dir,
+						old_dentry->d_name.name,
+						old_dentry->d_name.len,
+						btrfs_ino(old_dir),
+						whiteout_objectid,
+						S_IFCHR | WHITEOUT_MODE,
+						&whiteout_index);
+
+		if (IS_ERR(whiteout_inode)) {
+			ret = PTR_ERR(whiteout_inode);
+			btrfs_abort_transaction(trans, root, ret);
+			goto out_fail;
+		}
+
+		whiteout_inode->i_op = &btrfs_special_inode_operations;
+		init_special_inode(whiteout_inode, whiteout_inode->i_mode,
+			WHITEOUT_DEV);
+
+		ret = btrfs_init_inode_security(trans, whiteout_inode, old_dir,
+					&old_dentry->d_name);
+		if (ret) {
+			btrfs_abort_transaction(trans, root, ret);
+			goto out_fail;
+		}
+
+		ret = btrfs_add_nondir(trans, old_dir, old_dentry,
+					whiteout_inode, 0, whiteout_index);
+		if (ret) {
+			btrfs_abort_transaction(trans, root, ret);
+			goto out_fail;
+		}
+
+		ret = btrfs_update_inode(trans, root, whiteout_inode);
+		if (ret) {
+			btrfs_abort_transaction(trans, root, ret);
+			goto out_fail;
+		}
+
+		unlock_new_inode(whiteout_inode);
+		iput(whiteout_inode);
+	}
 out_fail:
 	btrfs_end_transaction(trans, root);
 out_notrans:
@@ -9478,14 +9534,14 @@ static int btrfs_rename2(struct inode *old_dir, struct dentry *old_dentry,
 			 struct inode *new_dir, struct dentry *new_dentry,
 			 unsigned int flags)
 {
-	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
+	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
 		return -EINVAL;
-	
+
 	if (flags & RENAME_EXCHANGE)
 		return btrfs_rename_exchange(old_dir, old_dentry, new_dir,
 					  new_dentry);
 
-	return btrfs_rename(old_dir, old_dentry, new_dir, new_dentry);
+	return btrfs_rename(old_dir, old_dentry, new_dir, new_dentry, flags);
 }
 
 static void btrfs_run_delalloc_work(struct btrfs_work *work)
@@ -10070,7 +10126,7 @@ static const struct inode_operations btrfs_dir_inode_operations = {
 	.get_acl	= btrfs_get_acl,
 	.set_acl	= btrfs_set_acl,
 	.update_time	= btrfs_update_time,
-	.tmpfile        = btrfs_tmpfile,
+	.tmpfile	= btrfs_tmpfile,
 };
 static const struct inode_operations btrfs_dir_ro_inode_operations = {
 	.lookup		= btrfs_lookup,
@@ -10088,7 +10144,7 @@ static const struct file_operations btrfs_dir_file_operations = {
 #ifdef CONFIG_COMPAT
 	.compat_ioctl	= btrfs_ioctl,
 #endif
-	.release        = btrfs_release_file,
+	.release	= btrfs_release_file,
 	.fsync		= btrfs_sync_file,
 };
 
